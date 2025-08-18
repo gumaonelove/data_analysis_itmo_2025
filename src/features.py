@@ -1,4 +1,6 @@
-from __future__ import annotations
+# from __future__ import annotations
+
+
 import pandas as pd
 import numpy as np
 
@@ -69,6 +71,8 @@ def customer_velocity(
     for h in (1, 6, 24):
         out[f'cust_tx_count_{h}h'] = _count_window(h)
 
+    # Restore original row order so downstream time-based split aligns with the baseline
+    out = out.sort_index()
     return out
 
 def clip_and_fill(df: pd.DataFrame) -> pd.DataFrame:

@@ -1,11 +1,20 @@
 # src/pipeline.py
+
+
 from __future__ import annotations
 import numpy as np
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, FunctionTransformer, RobustScaler
+
+# Helper to safely replace NaN and inf values for robust model input
+def _replace_infinite(X):
+    import numpy as _np
+    X = _np.asarray(X, dtype=_np.float64)
+    # Replace NaN and +/- inf; NaN->0, +inf/-inf to large finite caps so solvers remain stable
+    return _np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
 
 def build_preprocessor(X, drop_high_card: bool = True) -> ColumnTransformer:
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
@@ -18,6 +27,8 @@ def build_preprocessor(X, drop_high_card: bool = True) -> ColumnTransformer:
 
     num_pipe = Pipeline([
         ('imp', SimpleImputer(strategy='median')),
+        ('fix_inf', FunctionTransformer(_replace_infinite, feature_names_out='one-to-one')),
+        ('scale', RobustScaler()),
     ])
 
     # Совместимость: sklearn>=1.2 -> sparse_output, sklearn<1.2 -> sparse
@@ -38,5 +49,11 @@ def build_preprocessor(X, drop_high_card: bool = True) -> ColumnTransformer:
 
     return pre
 
-def build_logreg(class_weight='balanced', max_iter=400):
-    return LogisticRegression(max_iter=max_iter, class_weight=class_weight)
+def build_logreg(class_weight='balanced', max_iter=1000, C=0.2, solver='lbfgs', random_state=42):
+    return LogisticRegression(
+        max_iter=max_iter,
+        class_weight=class_weight,
+        C=C,
+        solver=solver,
+        random_state=random_state,
+    )

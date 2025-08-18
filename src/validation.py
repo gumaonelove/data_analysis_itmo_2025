@@ -1,6 +1,26 @@
+
+# src/validation.py
+
+
 from __future__ import annotations
 import numpy as np
 import pandas as pd
+
+
+def compute_time_cutoff(df: pd.DataFrame, ts_col: str = 'timestamp', test_size: float = 0.2):
+    """Return timestamp cutoff so that roughly `test_size` of the dataset falls into test by time."""
+    df_sorted = df.sort_values(ts_col)
+    n_test = int(len(df_sorted) * test_size)
+    if n_test <= 0:
+        return df_sorted[ts_col].max()
+    cutoff_idx = len(df_sorted) - n_test
+    return df_sorted.iloc[cutoff_idx][ts_col]
+
+def split_by_cutoff(df: pd.DataFrame, cutoff, ts_col: str = 'timestamp'):
+    """Split df using provided `cutoff` timestamp so that df[ts_col] <= cutoff -> train, > cutoff -> test."""
+    train = df[df[ts_col] <= cutoff]
+    test = df[df[ts_col] > cutoff]
+    return train, test
 
 def split_time_aware(df: pd.DataFrame, ts_col: str='timestamp', test_size: float=0.2):
     df = df.sort_values(ts_col)
