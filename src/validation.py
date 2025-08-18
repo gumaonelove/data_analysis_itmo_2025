@@ -8,13 +8,14 @@ import pandas as pd
 
 
 def compute_time_cutoff(df: pd.DataFrame, ts_col: str = 'timestamp', test_size: float = 0.2):
-    """Return timestamp cutoff so that roughly `test_size` of the dataset falls into test by time."""
-    df_sorted = df.sort_values(ts_col)
-    n_test = int(len(df_sorted) * test_size)
-    if n_test <= 0:
-        return df_sorted[ts_col].max()
-    cutoff_idx = len(df_sorted) - n_test
-    return df_sorted.iloc[cutoff_idx][ts_col]
+    """Return timestamp cutoff so that roughly `test_size` of the dataset falls into test by time.
+    Использует квантили по времени вместо полной сортировки (быстрее на больших данных).
+    """
+    s = pd.to_datetime(df[ts_col])
+    if test_size <= 0:
+        return s.max()
+    q = 1.0 - float(test_size)
+    return s.quantile(q, interpolation='nearest')
 
 def split_by_cutoff(df: pd.DataFrame, cutoff, ts_col: str = 'timestamp'):
     """Split df using provided `cutoff` timestamp so that df[ts_col] <= cutoff -> train, > cutoff -> test."""
@@ -54,16 +55,29 @@ def time_group_split_by_first_seen(df: pd.DataFrame, group_col: str, ts_col: str
           .agg(first_seen=('_ts', 'min'), pos=('is_fraud', 'sum'), n=('is_fraud', 'size'))
     )
     g = g.sort_values('first_seen')
-    n_test_groups = max(1, int(len(g) * test_frac))
-    def _make_split(k):
-        test_groups = set(g.iloc[-k:][group_col])
-        tr = d[~d[group_col].isin(test_groups)].drop(columns=['_ts'])
-        te = d[d[group_col].isin(test_groups)].drop(columns=['_ts'])
-        return tr, te
+    g = g.reset_index(drop=True)
+    n_groups = len(g)
+    n_test_groups = max(1, int(n_groups * test_frac))
+
+    # Вычисляем минимальный k, чтобы в тест попали и позитивы, и негативы (если это требуется)
     k = n_test_groups
-    train, test = _make_split(k)
-    if ensure_two_classes_in_test:
-        while test['is_fraud'].nunique() < 2 and k < len(g):
-            k += 1
-            train, test = _make_split(k)
-    return train, test
+    if ensure_two_classes_in_test and n_groups > 0:
+        g['neg'] = g['n'] - g['pos']
+        has_pos = (g['pos'].sum() > 0)
+        has_neg = (g['neg'].sum() > 0)
+        if has_pos and has_neg:
+            # Индексы последних (по времени) групп, содержащих хотя бы один положительный/отрицательный пример
+            last_pos_idx = g.index[g['pos'] > 0].max()
+            last_neg_idx = g.index[g['neg'] > 0].max()
+            # Минимальный хвост (k), который гарантированно включает обе эти группы
+            k_required_pos = n_groups - last_pos_idx
+            k_required_neg = n_groups - last_neg_idx
+            k = max(k, k_required_pos, k_required_neg)
+        # если в данных нет одного из классов, оставляем k как есть
+
+    k = min(max(1, int(k)), n_groups)
+
+    test_groups = set(g.iloc[-k:][group_col])
+    tr = d[~d[group_col].isin(test_groups)].drop(columns=['_ts'])
+    te = d[d[group_col].isin(test_groups)].drop(columns=['_ts'])
+    return tr, te

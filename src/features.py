@@ -3,6 +3,7 @@
 
 import pandas as pd
 import numpy as np
+from tqdm import tqdm  # type: ignore
 
 CATEGORICALS = [
     'vendor_category', 'vendor_type', 'vendor', 'country', 'city', 'city_size',
@@ -31,61 +32,98 @@ def add_basic_time_features(df: pd.DataFrame, ts_col: str = 'timestamp') -> pd.D
 def customer_velocity(
     df: pd.DataFrame,
     customer_col: str = 'customer_id',
-    ts_col: str = 'timestamp'
+    ts_col: str = 'timestamp',
+    progress: bool = True,
 ) -> pd.DataFrame:
     """
+    Быстрая реализация без Python-циклов: O(N) с векторизацией по каждому клиенту.
     Считает:
-      - time_since_prev_s: сек с предыдущей транзакции клиента
-      - cust_tx_count_{1,6,24}h: число транзакций клиента за окна 1/6/24 часа (без текущей)
-    Без утечек: окна считаются с closed='left' (только прошлые события).
-    Работает как через groupby.rolling(on=...), так и через fallback с временным индексом.
+      - time_since_prev_s
+      - cust_tx_count_{1,6,24}h (число ПРЕДЫДУЩИХ транзакций в окне, текущая не учитывается)
+    Границы окон соответствуют closed='left' (равно граничному значению — исключается).
     """
     out = df.copy()
     out[ts_col] = pd.to_datetime(out[ts_col], utc=False, errors='coerce')
-    out = out.sort_values([customer_col, ts_col])
 
-    ts = out[ts_col]
-    out['time_since_prev_s'] = (
-        ts - ts.groupby(out[customer_col]).shift(1)
-    ).dt.total_seconds()
+    # Сортируем и сохраняем исходные индексы
+    out_sorted = out.sort_values([customer_col, ts_col]).reset_index()
+    n = len(out_sorted)
 
-    # Пытаемся использовать быстрый путь (pandas ≥ 1.3 supports on=...)
-    def _count_window(hours: int) -> np.ndarray:
-        try:
-            cnt = (
-                out.groupby(customer_col)
-                   .rolling(f'{hours}h', on=ts_col, closed='left')[ts_col]
-                   .count()
-                   .reset_index(level=0, drop=True)
-            )
-            return cnt.to_numpy()
-        except Exception:
-            # Fallback: по группам с временным индексом
-            vals = []
-            for _, g in out.groupby(customer_col, sort=False):
-                s = pd.Series(1, index=g[ts_col])
-                rc = s.rolling(f'{hours}h', closed='left').sum()
-                vals.append(rc.to_numpy())
-            return np.concatenate(vals, axis=0)
+    # Время в наносекундах для быстрых разностей
+    t_ns = out_sorted[ts_col].values.astype('datetime64[ns]').astype('int64')
+    ONE_H = 3600 * 10**9
+    SIX_H = 6 * ONE_H
+    DAY   = 24 * ONE_H
 
-    for h in (1, 6, 24):
-        out[f'cust_tx_count_{h}h'] = _count_window(h)
+    # Результаты
+    time_since_prev = np.empty(n, dtype='float64')
+    cnt1  = np.zeros(n, dtype='int32')
+    cnt6  = np.zeros(n, dtype='int32')
+    cnt24 = np.zeros(n, dtype='int32')
 
-    # Restore original row order so downstream time-based split aligns with the baseline
-    out = out.sort_index()
-    return out
+    # Векторизованная обработка по каждому клиенту с прогресс-баром
+    indices_dict = out_sorted.groupby(customer_col, sort=False).indices
+    it = indices_dict.items()
+    if progress:
+        it = tqdm(it, total=len(indices_dict), desc='customer_velocity: groups')
+    for _, pos in it:
+        pos = np.asarray(pos)
+        t = t_ns[pos]
+        m = len(pos)
+        if m == 0:
+            continue
+
+        # Время с предыдущей транзакции, сек
+        dt = np.empty(m, dtype='float64')
+        dt[0] = np.nan
+        if m > 1:
+            dt[1:] = (t[1:] - t[:-1]) / 1e9
+        time_since_prev[pos] = dt
+
+        # Векторизованно считаем число предыдущих транзакций в окнах 1/6/24 часа
+        # Для closed='left' берём левую границу строго больше (tr - W)
+        # l = searchsorted(t, t - W + 1, side='left')
+        r_idx = np.arange(m, dtype=np.int64)
+        l1  = np.searchsorted(t, t - ONE_H + 1, side='left')
+        l6  = np.searchsorted(t, t - SIX_H + 1, side='left')
+        l24 = np.searchsorted(t, t - DAY   + 1, side='left')
+
+        cnt1[pos]  = (r_idx - l1).astype('int32')
+        cnt6[pos]  = (r_idx - l6).astype('int32')
+        cnt24[pos] = (r_idx - l24).astype('int32')
+
+    out_sorted['time_since_prev_s'] = time_since_prev
+    out_sorted['cust_tx_count_1h']  = cnt1
+    out_sorted['cust_tx_count_6h']  = cnt6
+    out_sorted['cust_tx_count_24h'] = cnt24
+
+    # Возвращаем исходный порядок строк
+    out_final = (
+        out_sorted
+        .set_index('index')
+        .loc[out.index]
+        .sort_index()
+    )
+    return out_final
 
 def clip_and_fill(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Простейшая очистка
     num_cols = df.select_dtypes(include=[np.number]).columns
-    for c in num_cols:
-        q1, q99 = df[c].quantile([0.01, 0.99])
-        df[c] = df[c].clip(q1, q99)
-    return df.fillna({
-        **{c: -1 for c in CATEGORICALS},
-        **{b: 0 for b in BINARIES}
-    })
+    if len(num_cols) > 0:
+        q = df[num_cols].quantile([0.01, 0.99])
+        lower = q.loc[0.01]
+        upper = q.loc[0.99]
+        # Векторное клиппирование по столбцам
+        df[num_cols] = df[num_cols].clip(lower=lower, upper=upper, axis=1)
+    # Аккуратно заполняем только существующие колонки
+    fill_map = {}
+    for c in CATEGORICALS:
+        if c in df.columns:
+            fill_map[c] = -1
+    for b in BINARIES:
+        if b in df.columns:
+            fill_map[b] = 0
+    return df.fillna(fill_map)
 
 
 # Device novelty features for H2
