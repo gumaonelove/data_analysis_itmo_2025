@@ -86,3 +86,14 @@ def clip_and_fill(df: pd.DataFrame) -> pd.DataFrame:
         **{c: -1 for c in CATEGORICALS},
         **{b: 0 for b in BINARIES}
     })
+
+
+# Device novelty features for H2
+def add_device_novelty(df: pd.DataFrame, customer_col: str = 'customer_id', device_col: str = 'device_fingerprint', ts_col: str = 'timestamp') -> pd.DataFrame:
+    """Adds per-customer device novelty: first use flag and usage index."""
+    out = df.copy()
+    out[ts_col] = pd.to_datetime(out[ts_col], errors='coerce')
+    out = out.sort_values([customer_col, ts_col])
+    out['cust_dev_tx_index'] = out.groupby([customer_col, device_col]).cumcount()
+    out['is_new_device_for_customer'] = (out['cust_dev_tx_index'] == 0).astype(int)
+    return out.sort_index()

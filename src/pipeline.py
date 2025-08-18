@@ -1,29 +1,24 @@
 # src/pipeline.py
-
-
 from __future__ import annotations
 import numpy as np
 from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, FunctionTransformer, RobustScaler
+from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder, FunctionTransformer, RobustScaler
 
-# Helper to safely replace NaN and inf values for robust model input
 def _replace_infinite(X):
-    import numpy as _np
-    X = _np.asarray(X, dtype=_np.float64)
-    # Replace NaN and +/- inf; NaN->0, +inf/-inf to large finite caps so solvers remain stable
-    return _np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
+    X = np.asarray(X, dtype=np.float64)
+    return np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
 
 def build_preprocessor(X, drop_high_card: bool = True) -> ColumnTransformer:
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = X.select_dtypes(include=['object', 'string', 'category', 'bool']).columns.tolist()
+    numeric = X.select_dtypes(include=[np.number]).columns.tolist()
+    categorical = X.select_dtypes(include=['object', 'string', 'category']).columns.tolist()
 
     if drop_high_card:
-        for hc in ['vendor', 'device_fingerprint', 'ip_address', 'card_number']:
-            if hc in cat_cols:
-                cat_cols.remove(hc)
+        # Исключаем суррогаты идентификаторов из OHE
+        high_card = [c for c in ['vendor', 'device_fingerprint', 'ip_address', 'card_number'] if c in categorical]
+        categorical = [c for c in categorical if c not in high_card]
 
     num_pipe = Pipeline([
         ('imp', SimpleImputer(strategy='median')),
@@ -31,29 +26,25 @@ def build_preprocessor(X, drop_high_card: bool = True) -> ColumnTransformer:
         ('scale', RobustScaler()),
     ])
 
-    # Совместимость: sklearn>=1.2 -> sparse_output, sklearn<1.2 -> sparse
-    try:
-        ohe = OneHotEncoder(handle_unknown='ignore', min_frequency=50, sparse_output=True)
-    except TypeError:
-        ohe = OneHotEncoder(handle_unknown='ignore', min_frequency=50, sparse=True)
-
     cat_pipe = Pipeline([
         ('imp', SimpleImputer(strategy='most_frequent')),
-        ('ohe', ohe),
+        # Ограничиваем кардинальность, игнорируем неизвестные
+        ('ohe', OneHotEncoder(handle_unknown='ignore', min_frequency=50)),
     ])
 
     pre = ColumnTransformer([
-        ('num', num_pipe, num_cols),
-        ('cat', cat_pipe, cat_cols),
-    ], remainder='drop')
+        ('num', num_pipe, numeric),
+        ('cat', cat_pipe, categorical),
+    ], remainder='drop')  # критично: дропаем остальные столбцы (в т.ч. сырые ID)
 
     return pre
 
-def build_logreg(class_weight='balanced', max_iter=1000, C=0.2, solver='lbfgs', random_state=42):
+def build_logreg(class_weight='balanced', max_iter=2000, C=0.1, solver='lbfgs', random_state=42):
     return LogisticRegression(
+        penalty='l2',
+        C=C,
         max_iter=max_iter,
         class_weight=class_weight,
-        C=C,
         solver=solver,
         random_state=random_state,
     )
