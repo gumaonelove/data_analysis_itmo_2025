@@ -4,7 +4,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
+from sklearn.preprocessing import OneHotEncoder, FunctionTransformer, StandardScaler, RobustScaler
+from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
@@ -19,6 +20,11 @@ REPORTS.mkdir(exist_ok=True, parents=True)
 
 TX_PATH = DATA_DIR / 'transaction_fraud_data.parquet'
 FX_PATH = DATA_DIR / 'historical_currency_exchange.parquet'
+
+def _replace_infinite(X: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float64)
+    # Replace NaN and +/- inf with finite caps; zeros for NaN
+    return np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
 
 def load_data() -> pd.DataFrame:
     df = pd.read_parquet(TX_PATH)
@@ -46,11 +52,18 @@ def build_pipeline(df: pd.DataFrame) -> Pipeline:
     categorical = [c for c in categorical if c not in high_card]
 
     pre = ColumnTransformer([
-        ('num', 'passthrough', numeric),
-        ('cat', OneHotEncoder(handle_unknown='ignore', min_frequency=50), categorical),
+        ('num', Pipeline([
+            ('impute', SimpleImputer(strategy='median')),
+            ('fix_inf', FunctionTransformer(_replace_infinite, feature_names_out='one-to-one')),
+            ('scale', RobustScaler()),
+        ]), numeric),
+        ('cat', Pipeline([
+            ('impute', SimpleImputer(strategy='most_frequent')),
+            ('ohe', OneHotEncoder(handle_unknown='ignore', min_frequency=50)),
+        ]), categorical),
     ], remainder='drop')
 
-    model = LogisticRegression(max_iter=200, class_weight='balanced', n_jobs=None)
+    model = LogisticRegression(max_iter=1000, class_weight='balanced', C=0.2, solver='lbfgs', random_state=42)
 
     pipe = Pipeline([
         ('prep', pre),
@@ -65,11 +78,19 @@ def evaluate(y_true, y_prob) -> dict:
     # Threshold при Precision >= 0.9
     prec, rec, thr = precision_recall_curve(y_true, y_prob)
     target_p = 0.9
-    mask = prec >= target_p
-    best = np.argmax(rec[mask]) if mask.any() else None
-    thr90 = float(thr[mask][best]) if best is not None and len(thr[mask])>0 else None
-    rec90 = float(rec[mask][best]) if best is not None else None
-    p90 = float(prec[mask][best]) if best is not None else None
+    # В precision_recall_curve длины: len(thr) = len(prec) - 1 = len(rec) - 1
+    prec_adj = prec[:-1]
+    rec_adj = rec[:-1]
+    mask = prec_adj >= target_p
+    if mask.any():
+        idx_in_mask = np.argmax(rec_adj[mask])
+        thr90 = float(thr[mask][idx_in_mask])
+        rec90 = float(rec_adj[mask][idx_in_mask])
+        p90 = float(prec_adj[mask][idx_in_mask])
+    else:
+        thr90 = None
+        rec90 = None
+        p90 = None
 
     return {
         'roc_auc': float(roc),
